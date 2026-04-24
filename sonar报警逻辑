@@ -1,0 +1,318 @@
+第一点，data -> server 调用链路是确定的。你日志里的：
+
+ApiClient uploadDeviceRealDataList[DataSonarSv(value=-67.85)] :ResponseObject(status=200...)
+对应当前代码里的 uploadDeviceRealDataList()，这个方法调用的是：
+
+apiAddress + "/api/handleRealDataList"
+所以这条链路是存在的。
+
+第二点，我之前说 server 每 3 秒算一次不严谨。从你这段生产日志看，uploadDeviceRealDataList 出现频率并不是每 3 秒一次，而是几十秒到一两分钟不等。原因可能是：
+
+data 收到的是声呐 echo 批数据，一批里包含很多 ping；
+日志只打印了 dataList.get(0)，没打印批次数量；
+实际每批里可能有多条 DataSonarSv，只是日志看不出来；
+或生产环境确实不是每 3 秒上报到 server。
+所以正确设计应该是：server 每收到一批 dataSonarSv 就处理一次，但连续时间必须按数据里的 time 字段计算，不能按接口调用时间计算。
+
+修正后的报警判断设计
+入口仍然放在：
+
+POST /api/handleRealDataList
+但逻辑改成批处理：
+
+1. server 收到 dataSonarSv 批次
+2. 按 deviceCode 分组
+3. 每个设备内按 time 升序排序
+4. 逐条用数据 time 推进状态机
+5. 达到持续时间后触发 SONAR_SV_VALUE
+伪代码：
+
+public void handle(List<JSONObject> dataList) {
+    Map<String, List<JSONObject>> groupByDevice = dataList.stream()
+        .filter(data -> "dataSonarSv".equals(data.getString("collectName")))
+        .filter(data -> data.getDouble("val") != null)
+        .collect(Collectors.groupingBy(data -> data.getString("deviceCode")));
+
+    groupByDevice.forEach((deviceCode, list) -> {
+        list.sort(Comparator.comparing(data -> parseTime(data.getString("time"))));
+        for (JSONObject data : list) {
+            handleOne(deviceCode, data);
+        }
+    });
+}
+handleOne() 不看当前系统时间，只看数据时间：
+
+currentTime = data.time
+sv = data.val
+intensity = sv + 80
+level = judgeLevel(intensity)
+连续时间怎么判断
+每个设备维护一个状态：
+
+deviceCode
+level
+startTime     连续开始的数据时间
+lastTime      上一条数据时间
+minValue
+maxValue
+triggered
+新数据进来：
+
+如果 intensity < 24：
+  清空状态
+
+如果当前 level 和缓存 level 不同：
+  重置状态，startTime = 当前数据 time
+
+如果当前 level 和缓存 level 相同：
+  更新 lastTime/minValue/maxValue
+  用 currentTime - startTime 判断是否达到持续时间
+触发条件：
+
+BLUE   24 <= intensity < 30，currentTime - startTime >= 2小时
+YELLOW 30 <= intensity < 36，currentTime - startTime >= 1小时
+RED    intensity >= 36，currentTime - startTime >= 0.5小时
+关于数据间隔
+这里要加一个“断点”判断，但不能写死 30 秒，因为你生产日志看起来不是 3 秒一批。
+
+更合理：
+
+如果同一设备相邻两条 data.time 间隔 > 允许断点时间，则连续中断
+允许断点时间建议先设成可配置：
+
+sonar:
+  sv-alarm:
+    max-gap-seconds: 180
+如果确认每条 ping 的 time 真的是 3 秒间隔，max-gap-seconds 可以设 30 秒。
+如果生产里每批只上传 1 条且间隔几十秒，那就设 180 秒或按实际采样周期调整。
+
+我现在更推荐的稳妥方案
+不要只依赖内存状态。做成“事件触发 + Mongo 校验”的混合方案：
+
+/api/handleRealDataList 收到 dataSonarSv 后触发判断。
+对每个设备的最新值判断它是否处于蓝/黄/红区间。
+如果处于某个区间，不直接只看内存累计，而是查 Mongo 最近窗口：
+蓝色查最近 2 小时
+黄色查最近 1 小时
+红色查最近 0.5 小时
+判断窗口内是否持续满足该等级条件。
+满足才触发 SONAR_SV_VALUE。
+这样即使：
+
+server 重启；
+接口调用不稳定；
+批数据间隔不固定；
+内存状态丢失；
+报警判断仍然可靠。
+
+最终建议
+按你的生产日志，我建议第一版不要纯内存状态机，改成：
+
+server 收到 dataSonarSv 批次时触发计算；
+用最新数据判断候选等级；
+再查询 Mongo 对应持续窗口做确认；
+确认窗口内持续满足条件后，调用 server 内部报警函数触发 SONAR_SV_VALUE。
+这样计算频率就是 uploadDeviceRealDataList 的实际调用频率，生产日志看起来大概几十秒一次；报警最多延迟到下一次上报，但持续 0.5/1/2 小时级别的报警，这个延迟可以接受。
+
+
+
+
+
+22:12
+几个前提和你先明确，防止过度设计：
+1.server重启频率很小
+2.server和data都在本机，网络很稳定
+3.批数据间隔不固定
+4.内存状态不用考虑丢失，因为维护的频次很低，需要考虑内存OOM的问题
+请你在修改方案
+22:35
+
+
+明确这 4 个前提后，我会把方案改回内存状态机为主，不做 Mongo 窗口扫描，也不做重启恢复。这样更简单、性能稳定、不会过度设计。
+
+修正后方案
+计算方式：server 每次收到 dataSonarSv 批数据时计算一次。
+
+判断依据：用数据自身的 time 字段推进连续时长，不用接口调用时间。
+
+状态存储：server 内存 ConcurrentHashMap，每个设备最多一条状态。10 个设备就是 10 条左右，OOM 风险极低。
+
+ConcurrentHashMap<String, SonarSvAlarmState> stateMap;
+数据流
+data 仍然负责：
+
+声呐数据解析 -> 写 Mongo dataSonarSv -> 调 server /api/handleRealDataList
+server 负责：
+
+接收 dataSonarSv -> 按设备分组 -> 按 time 排序 -> 状态机判断 -> 触发 SONAR_SV_VALUE
+接入点仍然是：
+
+DataApiController.java (line 196)
+
+@PostMapping("/handleRealDataList")
+public ResponseObject handleRealDataList(@RequestBody List<JSONObject> dataList) {
+    if (!dataList.isEmpty()) {
+        if (CollectName.DATA_SONAR_SV.getValue().equals(dataList.get(0).getString("collectName"))) {
+            sonarSvContinuousAlarmService.handle(dataList);
+        }
+        deviceDataService.handleRealDataList(dataList);
+    }
+    return ResponseObject.getSucceed();
+}
+状态设计
+每个设备维护：
+
+class SonarSvAlarmState {
+    private String deviceCode;
+    private MonitorAlarmLevel level;
+    private Date startTime;
+    private Date lastTime;
+    private Double minSv;
+    private Double maxSv;
+    private Double latestSv;
+    private Boolean triggered;
+}
+只需要这些字段。不存整段数据，不存队列，不存窗口数组，所以不会随着时间增长。
+
+判断规则
+原始值是 dataSonarSv.val。
+
+生物入侵强度 = val + 80
+等级：
+
+BLUE   24 <= 强度 < 30
+YELLOW 30 <= 强度 < 36
+RED    强度 >= 36
+NORMAL 强度 < 24
+等价：
+
+BLUE   -56 <= val < -50
+YELLOW -50 <= val < -44
+RED    val >= -44
+NORMAL val < -56
+持续时间：
+
+BLUE   2 小时
+YELLOW 1 小时
+RED    0.5 小时
+批数据处理
+因为批间隔不固定，所以每批内部要排序：
+
+public void handle(List<JSONObject> dataList) {
+    dataList.stream()
+        .filter(this::isSonarSv)
+        .filter(this::hasRequiredFields)
+        .collect(Collectors.groupingBy(data -> data.getString("deviceCode")))
+        .forEach((deviceCode, list) -> {
+            list.sort(Comparator.comparing(data -> parseTime(data.getString("time"))));
+            list.forEach(data -> handleOne(deviceCode, data));
+        });
+}
+这样即使一个批次里有很多历史 ping，也能按真实时间顺序累计。
+
+单条处理逻辑
+核心逻辑如下：
+
+1. 读 val 和 time
+2. 根据 val 判断 level
+3. 如果 level == NORMAL：清空该设备状态
+4. 如果没有旧状态：创建状态
+5. 如果等级变化：重置状态
+6. 如果等级不变：更新 lastTime/min/max
+7. 如果未触发且 lastTime - startTime >= 该等级持续时间：触发报警
+8. 触发后 triggered = true，同一连续段不重复报警
+伪代码：
+
+private void handleOne(String deviceCode, JSONObject data) {
+    Double sv = data.getDouble("val");
+    Date time = parseTime(data.getString("time"));
+    MonitorAlarmLevel level = judgeLevel(sv);
+
+    if (level == null) {
+        stateMap.remove(deviceCode);
+        return;
+    }
+
+    SonarSvAlarmState state = stateMap.get(deviceCode);
+
+    if (state == null || state.getLevel() != level || isDataGapTooLarge(state, time)) {
+        stateMap.put(deviceCode, newState(deviceCode, level, time, sv));
+        return;
+    }
+
+    updateState(state, time, sv);
+
+    if (!state.getTriggered() && reachDuration(state)) {
+        triggerAlarm(state);
+        state.setTriggered(true);
+    }
+}
+是否需要断点判断
+需要，但简单处理即可。因为批间隔不固定，不能设太小。
+
+我建议做成配置，默认 5 分钟：
+
+ai:
+  saturntech:
+    biz:
+      alarm:
+        sonar-sv:
+          max-gap-seconds: 300
+含义：
+
+同一设备前后两条 data.time 间隔超过 5 分钟，认为连续中断，重新计时。
+为什么需要这个：如果某设备 08:00 超限，09:00 才来下一条超限，中间没有数据，不能算“连续 1 小时超限”。
+
+如果你们确认“无数据期间也按持续超限算”，那这个断点判断可以去掉。但常规报警语义里，建议保留。
+
+报警触发
+报警种类固定：
+
+MonitorAlarmType.SONAR_SV_VALUE
+报警等级：
+
+BLUE / YELLOW / RED
+value/minValue/maxValue 存原始 sv。内容里写清楚换算后的生物入侵强度。
+
+MonitorAlarm alarm = new MonitorAlarm()
+    .setAlarmType(MonitorAlarmType.SONAR_SV_VALUE)
+    .setAlarmLevel(state.getLevel())
+    .setStatus(MonitorAlarmStatus.OPEN)
+    .setDeviceCode(state.getDeviceCode())
+    .setAlarmTime(state.getStartTime())
+    .setEndTime(state.getLastTime())
+    .setValue(state.getLatestSv())
+    .setMinValue(state.getMinSv())
+    .setMaxValue(state.getMaxSv())
+    .setContent(buildContent(state));
+触发时走 server 内部函数，复用 /api/alarm 的 SONAR_SV_VALUE 分支逻辑。
+
+内存 OOM 风险
+这个方案不会积累历史数据。内存规模大概是：
+
+设备数 * 每设备一个状态对象
+10 个设备就是 10 个对象。即使以后 1000 个设备，也只是 1000 个状态对象。不会按数据量增长。
+
+可以再加一个低频清理，防止设备废弃后状态长期存在：
+
+每 10 分钟清理 lastTime 超过 24 小时的状态
+但你们只有 10 个设备，这个可做可不做。我建议加一个简单清理，成本低。
+
+最终执行方案
+
+新增 SonarSvContinuousAlarmService。
+新增 SonarSvContinuousAlarmServiceImpl，只维护 ConcurrentHashMap<String, SonarSvAlarmState>。
+DataApiController.handleRealDataList 中识别 dataSonarSv 后调用该服务。
+抽出 triggerAlarm(AlarmDTO alarmDTO) 或 triggerSonarSvAlarm(MonitorAlarm alarm)，让 /api/alarm 和内部服务共用。
+添加配置：
+enabled
+max-gap-seconds
+蓝/黄/红阈值和持续时间可以先写常量，后续再配置化。
+写单元测试覆盖：
+连续满 2 小时触发蓝色
+连续满 1 小时触发黄色
+连续满 30 分钟触发红色
+中途正常清空
+等级变化重置
+超过 max-gap-seconds 重置
+同一连续段不重复触发
